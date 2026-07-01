@@ -1,0 +1,21 @@
+﻿const CACHE_NAME = "ixsayz-inventory-v6";
+const APP_SHELL = ["./", "./index.html", "./styles.css", "./app.js", "./firebase.js", "./manifest.json", "./js/auth.js", "./js/db.js", "./js/suppliers.js", "./js/deliveries.js", "./js/products.js", "./js/barcode.js", "./js/pdf-labels.js", "./js/pdf-reports.js", "./js/export.js", "./js/ui.js", "./assets/icons/icon-180.png", "./assets/icons/icon-192.png", "./assets/icons/icon-512.png", "./assets/icons/apple-touch-icon.png", "./assets/icons/icon-192.svg", "./assets/icons/icon-512.svg"];
+self.addEventListener("install", (event) => { event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL))); self.skipWaiting(); });
+self.addEventListener("activate", (event) => { event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))))); self.clients.claim(); });
+async function networkFirst(request) {
+  try {
+    const response = await fetch(request, { cache: "no-store" });
+    const cache = await caches.open(CACHE_NAME);
+    cache.put(request, response.clone());
+    return response;
+  } catch (err) {
+    return (await caches.match(request)) || caches.match("./index.html");
+  }
+}
+self.addEventListener("fetch", (event) => {
+  if (event.request.method !== "GET") return;
+  const url = new URL(event.request.url);
+  const isAppFile = url.origin === location.origin && /\.(html|js|css|json)$/.test(url.pathname);
+  if (event.request.mode === "navigate" || isAppFile) event.respondWith(networkFirst(event.request));
+  else event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request)));
+});
