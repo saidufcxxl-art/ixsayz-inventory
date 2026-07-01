@@ -1,0 +1,112 @@
+﻿import { hasFirebaseConfig } from "./firebase.js";
+import { allItems, createItem, deleteItem, ensureSettings, listenCollection, saveDeliveryWithProducts, updateItem } from "./js/db.js";
+import { generateUniqueEAN13, isValidEAN13 } from "./js/barcode.js";
+import { deliveryTotals } from "./js/deliveries.js";
+import { normalizeProduct, totalsForProducts } from "./js/products.js";
+import { makeLabelsPdf } from "./js/pdf-labels.js";
+import { deliveryReportPdf, supplierReportPdf, summaryReportPdf } from "./js/pdf-reports.js";
+import { productsCsv, productsXlsx } from "./js/export.js";
+import { closeModal, downloadBlob, escapeHtml, money, openModal, shareOrDownload, toast } from "./js/ui.js";
+
+const PUBLIC_UID = "public";
+const state = { user: { uid: PUBLIC_UID }, view: "dashboard", suppliers: [], deliveries: [], products: [], unsub: [] };
+const $ = (sel) => document.querySelector(sel);
+const root = $("#viewRoot");
+const title = $("#viewTitle");
+
+function byDate(items) { return [...items].sort((a, b) => String(b.date || "").localeCompare(String(a.date || ""))); }
+function optionList(items, labelFn) { return items.map((item) => `<option value="${item.id}">${escapeHtml(labelFn(item))}</option>`).join(""); }
+function setView(view) { state.view = view; document.querySelectorAll(".nav-btn").forEach((b) => b.classList.toggle("active", b.dataset.view === view)); render(); }
+function selectProductsByScope(scope, id) { if (scope === "delivery") return state.products.filter((p) => p.deliveryId === id); if (scope === "supplier") return state.products.filter((p) => p.supplierId === id); if (scope === "selected") return [...document.querySelectorAll("[data-pick-product]:checked")].map((c) => state.products.find((p) => p.id === c.value)).filter(Boolean); return state.products; }
+function stats() { const t = totalsForProducts(state.products); return { ...t, suppliers: state.suppliers.length, deliveries: state.deliveries.length }; }
+
+function subscribe(uid) {
+  state.unsub.forEach((fn) => fn()); state.unsub = [];
+  state.unsub.push(listenCollection(uid, "suppliers", (items) => { state.suppliers = items; render(); }));
+  state.unsub.push(listenCollection(uid, "deliveries", (items) => { state.deliveries = items; render(); }));
+  state.unsub.push(listenCollection(uid, "products", (items) => { state.products = items; render(); }));
+  ensureSettings(uid);
+}
+
+function render() {
+  const map = { dashboard: renderDashboard, suppliers: renderSuppliers, deliveries: renderDeliveries, products: renderProducts, labels: renderLabels, reports: renderReports, export: renderExport };
+  const names = { dashboard: "Главная", suppliers: "Поставщики", deliveries: "Поставки", products: "Товары", labels: "Печать", reports: "Отчеты", export: "Экспорт" };
+  title.textContent = names[state.view] || "IXSAYZ";
+  (map[state.view] || renderDashboard)();
+}
+
+function renderDashboard() {
+  const s = stats();
+  root.innerHTML = `<section class="metric-grid">
+    ${metric("Поставщиков", s.suppliers)}${metric("Поставок", s.deliveries)}${metric("Моделей", s.models)}${metric("Единиц", s.quantity)}${metric("Закупка", money(s.purchase))}${metric("Продажа", money(s.sale))}${metric("Прибыль", money(s.profit))}
+  </section><section class="action-grid"><button class="primary-btn" data-action="supplier-new">Добавить поставщика</button><button class="primary-btn" data-action="delivery-new">Добавить поставку</button><button class="ghost-btn" data-go="products">Все товары</button><button class="ghost-btn" data-go="labels">Печать ценников</button><button class="ghost-btn" data-go="reports">Отчеты</button><button class="ghost-btn" data-go="export">Экспорт</button></section><section class="panel"><div class="section-head"><h3>Последние поставки</h3><button class="text-btn" data-go="suppliers">Поставщики</button></div>${deliveryCards(byDate(state.deliveries).slice(0,5))}</section>`;
+}
+function metric(label, value) { return `<article class="metric"><span>${label}</span><strong>${value}</strong></article>`; }
+function deliveryCards(items) { return items.length ? items.map((d) => `<div class="list-card"><b>${escapeHtml(d.deliveryNumber || "Без номера")}</b><span>${escapeHtml(d.supplierName || "-")} · ${escapeHtml(d.date || "")}</span><span>${money(d.totalPurchase)} / ${money(d.totalSale)}</span><div class="card-actions"><button data-action="delivery-edit" data-id="${d.id}">Изменить</button><button data-action="delivery-delete" data-id="${d.id}">Удалить</button></div></div>`).join("") : `<p class="empty">Поставок пока нет.</p>`; }
+
+function renderSuppliers() {
+  root.innerHTML = `<section class="toolbar"><button class="primary-btn" data-action="supplier-new">Добавить поставщика</button></section><section class="list-stack">${state.suppliers.map((s) => { const ps = state.products.filter((p) => p.supplierId === s.id); const ds = state.deliveries.filter((d) => d.supplierId === s.id); const total = totalsForProducts(ps); return `<article class="list-card"><b>${escapeHtml(s.supplierCode || "-")} · ${escapeHtml(s.name)}</b><span>${escapeHtml(s.phone || "")}</span><span>${ds.length} поставок · ${total.models} моделей · ${total.quantity} ед.</span><span>${money(total.purchase)} / ${money(total.sale)} / ${money(total.profit)}</span><div class="card-actions"><button data-action="supplier-open" data-id="${s.id}">Открыть</button><button data-action="supplier-edit" data-id="${s.id}">Изменить</button><button data-action="supplier-delete" data-id="${s.id}">Удалить</button></div></article>`; }).join("") || `<p class="empty">Добавьте первого поставщика.</p>`}</section>`;
+}
+function supplierForm(s = {}) { openModal(s.id ? "Редактировать поставщика" : "Новый поставщик", `<form id="supplierForm" class="form-grid"><input type="hidden" name="id" value="${s.id || ""}"><label>Код поставщика<input name="supplierCode" required value="${escapeHtml(s.supplierCode || `P${state.suppliers.length + 1}`)}"></label><label>Название<input name="name" required value="${escapeHtml(s.name || "")}"></label><label>Телефон<input name="phone" value="${escapeHtml(s.phone || "")}"></label><label>Комментарий<textarea name="comment">${escapeHtml(s.comment || "")}</textarea></label><button class="primary-btn" type="submit">Сохранить</button></form>`); }
+function openSupplier(id) { const s = state.suppliers.find((x) => x.id === id); const ps = state.products.filter((p) => p.supplierId === id); const ds = state.deliveries.filter((d) => d.supplierId === id); const total = totalsForProducts(ps); openModal(s.name, `<div class="mini-stats"><b>${money(total.purchase)}</b><span>Закупка</span><b>${money(total.sale)}</b><span>Продажа</span><b>${total.models}</b><span>Моделей</span><b>${total.quantity}</b><span>Единиц</span></div><h4>Поставки</h4>${deliveryCards(ds)}`); }
+
+function renderDeliveries() { root.innerHTML = `<section class="toolbar"><button class="primary-btn" data-action="delivery-new">Добавить завоз</button></section><section class="list-stack">${deliveryCards(byDate(state.deliveries))}</section>`; }
+function productRowHtml(p = {}) { return `<div class="product-row"><label>Категория<input name="category" value="${escapeHtml(p.category || "")}"></label><label>Название<input name="productName" required value="${escapeHtml(p.productName || "")}"></label><label>Артикул<input name="article" value="${escapeHtml(p.article || "")}"></label><label>Размер<input name="size" value="${escapeHtml(p.size || "")}"></label><label>Пол<select name="gender"><option></option><option ${p.gender === "Мужской" ? "selected" : ""}>Мужской</option><option ${p.gender === "Женский" ? "selected" : ""}>Женский</option><option ${p.gender === "Унисекс" ? "selected" : ""}>Унисекс</option></select></label><label>Закупка<input name="purchasePrice" type="number" min="0" step="1" value="${p.purchasePrice || 0}"></label><label>Продажа<input name="salePrice" type="number" min="0" step="1" value="${p.salePrice || 0}"></label><label>Кол-во<input name="quantity" type="number" min="1" step="1" value="${p.quantity || 1}"></label><label>Штрихкод<input name="barcode" inputmode="numeric" value="${escapeHtml(p.barcode || "")}" placeholder="Авто EAN-13"></label><label>Ценников<input name="labelQty" type="number" min="1" step="1" value="${p.labelQty || p.quantity || 1}"></label><label>Комментарий<input name="comment" value="${escapeHtml(p.comment || "")}"></label><button class="danger-btn" type="button" data-action="row-remove">Удалить строку</button></div>`; }
+function deliveryForm(d = {}) { const products = d.id ? state.products.filter((p) => p.deliveryId === d.id) : [{}]; openModal(d.id ? "Редактировать завоз" : "Новый завоз", `<form id="deliveryForm" class="form-grid"><input type="hidden" name="id" value="${d.id || ""}"><label>Поставщик<select name="supplierId" required><option value="">Выберите</option>${optionList(state.suppliers, (s) => `${s.supplierCode || ""} ${s.name}`)}</select></label><label>Дата<input name="date" type="date" required value="${d.date || new Date().toISOString().slice(0,10)}"></label><label>Номер поставки<input name="deliveryNumber" required value="${escapeHtml(d.deliveryNumber || "")}"></label><label>Комментарий<textarea name="comment">${escapeHtml(d.comment || "")}</textarea></label><div class="section-head"><h4>Товары</h4><button class="text-btn" type="button" data-action="row-add">+ строка</button></div><div id="productRows">${products.map(productRowHtml).join("")}</div><button class="primary-btn" type="submit">Сохранить завоз</button></form>`); const select = $("#deliveryForm [name=supplierId]"); if (select) select.value = d.supplierId || ""; }
+
+function renderProducts() {
+  const cats = [...new Set(state.products.map((p) => p.category).filter(Boolean))]; const sizes = [...new Set(state.products.map((p) => p.size).filter(Boolean))];
+  root.innerHTML = `<section class="filters"><input data-filter="q" placeholder="Поиск по названию или штрихкоду"><select data-filter="category"><option value="">Все категории</option>${cats.map((c) => `<option>${escapeHtml(c)}</option>`).join("")}</select><select data-filter="supplier"><option value="">Все поставщики</option>${optionList(state.suppliers, (s) => s.name)}</select><select data-filter="size"><option value="">Все размеры</option>${sizes.map((s) => `<option>${escapeHtml(s)}</option>`).join("")}</select><select data-filter="gender"><option value="">Любой пол</option><option>Мужской</option><option>Женский</option><option>Унисекс</option></select></section><section id="productsList" class="list-stack"></section>`;
+  filterProducts();
+}
+function filterProducts() { const vals = Object.fromEntries([...document.querySelectorAll("[data-filter]")].map((el) => [el.dataset.filter, el.value.toLowerCase()])); const items = state.products.filter((p) => (!vals.q || `${p.productName} ${p.barcode}`.toLowerCase().includes(vals.q)) && (!vals.category || String(p.category).toLowerCase() === vals.category) && (!vals.supplier || p.supplierId === document.querySelector('[data-filter="supplier"]').value) && (!vals.size || String(p.size).toLowerCase() === vals.size) && (!vals.gender || String(p.gender).toLowerCase() === vals.gender)); $("#productsList").innerHTML = items.map(productCard).join("") || `<p class="empty">Ничего не найдено.</p>`; }
+function productCard(p) { return `<article class="list-card"><b>${escapeHtml(p.productName)}</b><span>${escapeHtml(p.category || "-")} · размер ${escapeHtml(p.size || "-")} · ${escapeHtml(p.gender || "-")}</span><span>${escapeHtml(p.supplierName || "-")} / ${escapeHtml(p.deliveryNumber || "-")}</span><span>${money(p.purchasePrice)} → ${money(p.salePrice)} · остаток ${p.stock ?? p.quantity}</span><code>${escapeHtml(p.barcode)}</code><div class="card-actions"><button data-action="product-open" data-id="${p.id}">Карточка</button><button data-action="product-edit" data-id="${p.id}">Изменить</button><button data-action="product-delete" data-id="${p.id}">Удалить</button></div></article>`; }
+function productForm(p) { openModal("Редактировать товар", `<form id="productForm" class="form-grid"><input type="hidden" name="id" value="${p.id}">${productRowHtml(p)}<label>Остаток<input name="stock" type="number" min="0" value="${p.stock ?? p.quantity ?? 0}"></label><button class="primary-btn" type="submit">Сохранить товар</button></form>`); }
+function openProduct(id) { const p = state.products.find((x) => x.id === id); openModal(p.productName, `<div class="detail-grid"><span>Категория</span><b>${escapeHtml(p.category)}</b><span>Артикул</span><b>${escapeHtml(p.article)}</b><span>Размер</span><b>${escapeHtml(p.size)}</b><span>Пол</span><b>${escapeHtml(p.gender)}</b><span>Поставщик</span><b>${escapeHtml(p.supplierName)}</b><span>Поставка</span><b>${escapeHtml(p.deliveryNumber)}</b><span>Закупка</span><b>${money(p.purchasePrice)}</b><span>Продажа</span><b>${money(p.salePrice)}</b><span>Количество</span><b>${p.quantity}</b><span>Остаток</span><b>${p.stock ?? p.quantity}</b><span>Штрихкод</span><b>${escapeHtml(p.barcode)}</b><span>Дата</span><b>${escapeHtml(p.date || "-")}</b></div>`); }
+
+function renderLabels() { root.innerHTML = `<section class="panel"><label>Поставка<select id="labelDelivery"><option value="">Все поставки</option>${optionList(state.deliveries, (d) => `${d.deliveryNumber} ${d.supplierName}`)}</select></label><label>Поставщик<select id="labelSupplier"><option value="">Все поставщики</option>${optionList(state.suppliers, (s) => s.name)}</select></label><button class="primary-btn" data-action="labels-make">Создать PDF ценников</button></section><section class="list-stack">${state.products.map((p) => `<label class="pick-card"><input type="checkbox" data-pick-product value="${p.id}"> <span>${escapeHtml(p.productName)} · ${escapeHtml(p.barcode)} · ${p.labelQty || p.quantity} шт.</span></label>`).join("") || `<p class="empty">Нет товаров для печати.</p>`}</section>`; }
+function renderReports() { root.innerHTML = `<section class="panel"><label>Отчет по поставке<select id="reportDelivery"><option value="">Выберите</option>${optionList(state.deliveries, (d) => `${d.deliveryNumber} ${d.supplierName}`)}</select></label><button class="primary-btn" data-action="report-delivery">PDF по поставке</button></section><section class="panel"><label>Отчет по поставщику<select id="reportSupplier"><option value="">Выберите</option>${optionList(state.suppliers, (s) => s.name)}</select></label><button class="primary-btn" data-action="report-supplier">PDF по поставщику</button></section><section class="panel"><button class="ghost-btn" data-action="report-summary">Общий отчет PDF</button></section>`; }
+function renderExport() { root.innerHTML = `<section class="panel"><label>Что экспортировать<select id="exportScope"><option value="all">Все товары</option><option value="delivery">Одну поставку</option><option value="supplier">Одного поставщика</option><option value="selected">Выбранные товары</option></select></label><label>Поставка<select id="exportDelivery"><option value="">Выберите</option>${optionList(state.deliveries, (d) => `${d.deliveryNumber} ${d.supplierName}`)}</select></label><label>Поставщик<select id="exportSupplier"><option value="">Выберите</option>${optionList(state.suppliers, (s) => s.name)}</select></label><label>Формат<select id="exportFormat"><option value="semicolon">CSV ;</option><option value="comma">CSV ,</option><option value="xlsx">XLSX</option></select></label><button class="primary-btn" data-action="export-make">Скачать экспорт</button></section><section class="list-stack">${state.products.map((p) => `<label class="pick-card"><input type="checkbox" data-pick-product value="${p.id}"> <span>${escapeHtml(p.productName)} · ${escapeHtml(p.barcode)}</span></label>`).join("")}</section>`; }
+
+async function saveSupplier(form) { const data = Object.fromEntries(new FormData(form)); const id = data.id; delete data.id; if (id) await updateItem(state.user.uid, "suppliers", id, data); else await createItem(state.user.uid, "suppliers", data); closeModal(); toast("Поставщик сохранен"); }
+async function saveProduct(form) { const data = Object.fromEntries(new FormData(form)); const id = data.id; delete data.id; const product = normalizeProduct(data); product.stock = Number(data.stock ?? product.quantity); if (!isValidEAN13(product.barcode)) return toast("Штрихкод должен быть корректным EAN-13"); await updateItem(state.user.uid, "products", id, product); closeModal(); toast("Товар сохранен"); }
+async function saveDelivery(form) { const data = Object.fromEntries(new FormData(form)); const supplier = state.suppliers.find((s) => s.id === data.supplierId); if (!supplier) return toast("Выберите поставщика"); const existing = (await allItems(state.user.uid, "products")).map((p) => p.barcode); const rows = []; for (const rowEl of form.querySelectorAll(".product-row")) { const row = Object.fromEntries([...rowEl.querySelectorAll("input,select,textarea")].map((el) => [el.name, el.value])); let product = normalizeProduct(row); if (!product.productName) continue; if (!product.barcode) product.barcode = await generateUniqueEAN13([...existing, ...rows.map((r) => r.barcode)]); if (!isValidEAN13(product.barcode)) return toast(`Некорректный EAN-13: ${product.barcode}`); product.labelQty = Number(product.labelQty || product.quantity); rows.push(product); } if (!rows.length) return toast("Добавьте хотя бы одну строку товара"); const totals = deliveryTotals(rows); const id = data.id; const delivery = { supplierId: supplier.id, supplierName: supplier.name, supplierCode: supplier.supplierCode, deliveryNumber: data.deliveryNumber, date: data.date, comment: data.comment, ...totals }; await saveDeliveryWithProducts(state.user.uid, id, delivery, rows); closeModal(); toast("Завоз сохранен"); }
+
+async function handleAction(action, id, target) {
+  if (action === "supplier-new") supplierForm();
+  if (action === "supplier-edit") supplierForm(state.suppliers.find((s) => s.id === id));
+  if (action === "supplier-open") openSupplier(id);
+  if (action === "supplier-delete" && confirm("Удалить поставщика? Товары и поставки останутся.")) { await deleteItem(state.user.uid, "suppliers", id); toast("Поставщик удален"); }
+  if (action === "delivery-new") deliveryForm();
+  if (action === "delivery-edit") deliveryForm(state.deliveries.find((d) => d.id === id));
+  if (action === "delivery-delete" && confirm("Удалить поставку и ее товары?")) { for (const p of state.products.filter((p) => p.deliveryId === id)) await deleteItem(state.user.uid, "products", p.id); await deleteItem(state.user.uid, "deliveries", id); toast("Поставка удалена"); }
+  if (action === "row-add") $("#productRows").insertAdjacentHTML("beforeend", productRowHtml({}));
+  if (action === "row-remove") target.closest(".product-row").remove();
+  if (action === "product-open") openProduct(id);
+  if (action === "product-edit") productForm(state.products.find((p) => p.id === id));
+  if (action === "product-delete" && confirm("Удалить товар?")) { await deleteItem(state.user.uid, "products", id); toast("Товар удален"); }
+  if (action === "labels-make") { let items = state.products; const delivery = $("#labelDelivery").value; const supplier = $("#labelSupplier").value; const picked = [...document.querySelectorAll("[data-pick-product]:checked")].map((c) => c.value); if (delivery) items = items.filter((p) => p.deliveryId === delivery); if (supplier) items = items.filter((p) => p.supplierId === supplier); if (picked.length) items = items.filter((p) => picked.includes(p.id)); if (!items.length) return toast("Нет товаров для PDF"); await shareOrDownload(makeLabelsPdf(items), "ixsayz-labels.pdf"); }
+  if (action === "report-delivery") { const d = state.deliveries.find((x) => x.id === $("#reportDelivery").value); if (!d) return toast("Выберите поставку"); downloadBlob(deliveryReportPdf(d, state.products.filter((p) => p.deliveryId === d.id)), `delivery-${d.deliveryNumber || d.id}.pdf`); }
+  if (action === "report-supplier") { const s = state.suppliers.find((x) => x.id === $("#reportSupplier").value); if (!s) return toast("Выберите поставщика"); downloadBlob(supplierReportPdf(s, state.deliveries.filter((d) => d.supplierId === s.id), state.products.filter((p) => p.supplierId === s.id)), `supplier-${s.supplierCode || s.id}.pdf`); }
+  if (action === "report-summary") downloadBlob(summaryReportPdf(state.suppliers, state.deliveries, state.products), "ixsayz-summary.pdf");
+  if (action === "export-make") { const scope = $("#exportScope").value; const idValue = scope === "delivery" ? $("#exportDelivery").value : scope === "supplier" ? $("#exportSupplier").value : ""; const items = selectProductsByScope(scope, idValue); if (!items.length) return toast("Нет товаров для экспорта"); const fmt = $("#exportFormat").value; if (fmt === "xlsx") downloadBlob(productsXlsx(items), "ixsayz-products.xlsx"); else downloadBlob(productsCsv(items, fmt === "comma" ? "," : ";"), "ixsayz-products.csv"); }
+}
+
+document.addEventListener("click", async (e) => { const go = e.target.closest("[data-go]"); if (go) setView(go.dataset.go); const actionEl = e.target.closest("[data-action]"); if (actionEl) await handleAction(actionEl.dataset.action, actionEl.dataset.id, actionEl); });
+document.addEventListener("input", (e) => { if (e.target.matches("[data-filter]")) filterProducts(); if (e.target.name === "quantity") { const row = e.target.closest(".product-row"); const label = row?.querySelector('[name="labelQty"]'); if (label && (!label.value || Number(label.value) < 1)) label.value = e.target.value; } });
+document.addEventListener("submit", async (e) => { e.preventDefault(); if (e.target.id === "supplierForm") await saveSupplier(e.target); if (e.target.id === "deliveryForm") await saveDelivery(e.target); if (e.target.id === "productForm") await saveProduct(e.target); });
+$("#logoutBtn").addEventListener("click", () => window.location.reload());
+$("#modalClose").addEventListener("click", closeModal);
+document.querySelectorAll(".nav-btn").forEach((btn) => btn.addEventListener("click", () => setView(btn.dataset.view)));
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(() => {});
+if (!hasFirebaseConfig) {
+  $("#authMessage").textContent = "Вставьте Firebase config в firebase.js, затем обновите страницу.";
+} else {
+  $("#authScreen").classList.add("hidden");
+  $("#mainApp").classList.remove("hidden");
+  subscribe(PUBLIC_UID);
+  render();
+}
+
+
