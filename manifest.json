@@ -1,0 +1,15 @@
+﻿{
+  "name": "IXSAYZ Inventory",
+  "short_name": "IXSAYZ",
+  "description": "Мобильный складской учет, поставки, штрихкоды, PDF-ценники и экспорт.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#111111",
+  "background_color": "#111111",
+  "icons": [
+    { "src": "./assets/icons/icon-192.svg", "sizes": "192x192", "type": "image/svg+xml", "purpose": "any maskable" },
+    { "src": "./assets/icons/icon-512.svg", "sizes": "512x512", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
